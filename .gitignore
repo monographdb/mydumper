@@ -15,4 +15,6 @@ docs/man/
 export-*
 mydumper
 myloader
-
+.cache
+build 
+.vscode

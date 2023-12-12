@@ -22,6 +22,7 @@
 #include <string.h>
 #include "common.h"
 #include <errno.h>
+#include <unistd.h>
 #include "myloader.h"
 //#include "myloader_jobs_manager.h"
 #include "myloader_common.h"
@@ -29,18 +30,19 @@
 #include "connection.h"
 #include "myloader_intermediate_queue.h"
 #include "myloader_process.h"
+const guint err_oom = 216;
 gboolean skip_definer = FALSE;
 int restore_data_in_gstring_by_statement(struct thread_data *td, GString *data, gboolean is_schema, guint *query_counter)
 {
-  
   guint en=mysql_real_query(td->thrconn, data->str, data->len);
   if (en) {
+    uint my_err = mysql_errno(td->thrconn);
     if (is_schema)
       g_warning("Thread %d: Error restoring %d: %s %s", td->thread_id, en, data->str, mysql_error(td->thrconn));
     else{
       g_warning("Thread %d: Error restoring %d: %s", td->thread_id, en, mysql_error(td->thrconn));
     }
-
+    // Maybe need reconnect
     if (mysql_ping(td->thrconn)) {
       m_connect(td->thrconn);
       execute_gstring(td->thrconn, set_session);
@@ -52,9 +54,27 @@ int restore_data_in_gstring_by_statement(struct thread_data *td, GString *data, 
       }
     }
 
-    g_warning("Thread %d: Retrying last failed executed statement", td->thread_id);
-    g_atomic_int_inc(&(detailed_errors.retries));
-    if (mysql_real_query(td->thrconn, data->str, data->len)) {
+    if (my_err == err_oom) {
+      // Keep retry if monograph is out of memory
+      const guint max_retry = 64;
+      guint wait_secs = 1;
+      guint retry_cost = 0;
+      for (guint r = 0; my_err == err_oom && r < max_retry; r++) {
+        retry_cost += wait_secs;
+        sleep(wait_secs);
+        if (wait_secs < 128) wait_secs <<= 1;
+        g_warning("Thread %d: Retrying after OOM %d", td->thread_id, r);
+        g_atomic_int_inc(&(detailed_errors.retries));
+        en = mysql_real_query(td->thrconn, data->str, data->len);
+        my_err = en ? mysql_errno(td->thrconn) : 0;
+      }
+      g_info("Thread %d: retry cost total %d seconds", td->thread_id, retry_cost);
+    } else {
+      g_warning("Thread %d: Retrying last failed executed statement", td->thread_id);
+      g_atomic_int_inc(&(detailed_errors.retries));
+      en = mysql_real_query(td->thrconn, data->str, data->len);
+    }
+    if (en) {
       if (is_schema)
         g_critical("Thread %d: Error restoring: %s %s", td->thread_id, data->str, mysql_error(td->thrconn));
       else{
@@ -64,6 +84,7 @@ int restore_data_in_gstring_by_statement(struct thread_data *td, GString *data, 
       return 1;
     }
   }
+
   *query_counter=*query_counter+1;
   if (is_schema==FALSE) {
     if (commit_count > 1) {
