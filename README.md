@@ -127,7 +127,10 @@ sudo port select mysql
 Run:
 
 ```shell
-cmake .
+sudo apt install cmake g++ pkg-config libmariadb-dev-compat libpcre3-dev libglib2.0-dev zstd
+
+mkdir build && cd build
+cmake .. -DCMAKE_EXPORT_COMPILE_COMMANDS=1
 make
 sudo make install
 ```

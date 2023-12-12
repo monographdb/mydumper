@@ -17,3 +17,5 @@ mydumper
 myloader
 sakila-db*
 data/
+build
+.vscode

@@ -22,6 +22,7 @@
 #include <string.h>
 #include "common.h"
 #include <errno.h>
+#include <unistd.h>
 #include "myloader.h"
 //#include "myloader_jobs_manager.h"
 #include "myloader_common.h"
@@ -108,10 +109,12 @@ void wait_restore_threads_to_close(){
     g_thread_join(restore_threads[n]);
 }
 
+const guint err_oom = 216;
 int restore_data_in_gstring_by_statement(struct connection_data *cd, GString *data, gboolean is_schema, guint *query_counter)
 {
   guint en=mysql_real_query(cd->thrconn, data->str, data->len);
   if (en) {
+    uint my_err = mysql_errno(cd->thrconn);
     if (is_schema)
       g_warning("Connection %ld - ERROR %d: %s\n%s", cd->thread_id, mysql_errno(cd->thrconn), mysql_error(cd->thrconn), data->str);
     else{
@@ -119,6 +122,7 @@ int restore_data_in_gstring_by_statement(struct connection_data *cd, GString *da
     }
 
     if ( mysql_errno(cd->thrconn) != 0 && !g_list_find(ignore_errors_list, GINT_TO_POINTER(mysql_errno(cd->thrconn) ))){
+      // Maybe need reconnect
       if (mysql_ping(cd->thrconn)) {
         mysql_close(cd->thrconn);
         cd->thrconn=mysql_init(NULL);
@@ -133,8 +137,26 @@ int restore_data_in_gstring_by_statement(struct connection_data *cd, GString *da
         }
       }
 
-      g_atomic_int_inc(&(detailed_errors.retries));
-      if (mysql_real_query(cd->thrconn, data->str, data->len)) {
+      if (my_err == err_oom) {
+        // Keep retry if EloqSQL is out of memory
+        const guint max_retry = 64;
+        guint wait_secs = 1;
+        guint retry_cost = 0;
+        for (guint r = 0; my_err == err_oom && r < max_retry; r++) {
+          retry_cost += wait_secs;
+          sleep(wait_secs);
+          if (wait_secs < 128) wait_secs <<= 1;
+          g_warning("Thread %ld: Retrying after OOM %d", cd->thread_id, r);
+          g_atomic_int_inc(&(detailed_errors.retries));
+          en = mysql_real_query(cd->thrconn, data->str, data->len);
+          my_err = en ? mysql_errno(cd->thrconn) : 0;
+        }
+        g_info("Thread %ld: retry cost total %d seconds", cd->thread_id, retry_cost);
+      } else {
+        g_atomic_int_inc(&(detailed_errors.retries));
+        en = mysql_real_query(cd->thrconn, data->str, data->len);
+      }
+      if (en) {
         if (is_schema)
           g_critical("Connection %ld - ERROR %d: %s\n%s", cd->thread_id, mysql_errno(cd->thrconn), mysql_error(cd->thrconn), data->str);
         else{
